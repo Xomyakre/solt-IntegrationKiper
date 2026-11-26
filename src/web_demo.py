@@ -79,6 +79,7 @@ _config.read_dict({
     'Web': {'port': '8000', 'admin_user': 'admin', 'admin_password': ''},
     'RK': {'host': '127.0.0.1', 'port': '8088', 'user': '', 'password': '', 'orderidentifier': 'SeqNum'},
     'ComPort': {'port': 'COM1'},
+    'Solt': {'cancel_target': 'off'},
     'Log': {'log_dir': 'log', 'log_count': '10', 'log_interval': '1'},
 })
 _config_exists = os.path.exists(CONFIG_FILE)
@@ -123,6 +124,14 @@ ORDER_IDENTIFIERS = ('SeqNum', 'OrderNum')
 DEFAULT_PORT = sys.argv[1] if len(sys.argv) > 1 else _config['ComPort']['port']
 
 PAGER_MIN, PAGER_MAX = 1, 9999
+
+# Что делать при статусе «Выдан»: off — ничего (вызов снимает гость кнопкой на пейджере
+# или возвратом на станцию), SP / SG — отправить CANCEL с этой целью.
+# В протоколе SQ400 v1.0 отмена от PC не описана, рабочий вариант подбирается на месте.
+CANCEL_TARGETS = ('off', 'SP', 'SG')
+CANCEL_TARGET = _config['Solt']['cancel_target']
+if CANCEL_TARGET not in CANCEL_TARGETS:
+    CANCEL_TARGET = 'off'
 
 # Статусы заказа, приходящие от модуля RKeeper KDS в поле "state" вебхука.
 # 0 + paid=1 — новый оплаченный заказ (CALL: пейджеры на зарядной станции получают номер)
@@ -321,10 +330,12 @@ async def call(number: int):
 
 
 @panel.post('/cancel/{number}')
-async def cancel(number: int):
+async def cancel(number: int, target: str = 'SP'):
     if not solt:
         return {'ok': False, 'error': 'not connected'}
-    ok = await asyncio.to_thread(solt.cancel, number)
+    if target.upper() not in ('SP', 'SG'):
+        return {'ok': False, 'error': 'target должен быть SP или SG'}
+    ok = await asyncio.to_thread(solt.cancel, number, target)
     return {'ok': ok}
 
 
@@ -404,6 +415,9 @@ async def _handle_kds_event(body_text: str):
     elif state == KDS_STATE_ASSEMBLED:
         action = 'call'
     elif state == KDS_STATE_ISSUED:
+        if CANCEL_TARGET == 'off':
+            logger.info(f'[KDS] guid={guid} выдан: сброс пейджера отключён ([Solt] cancel_target = off)')
+            return
         action = 'cancel'
     else:
         logger.info(f'[KDS] guid={guid} state={state} paid={paid}: для этого статуса действий нет')
@@ -431,8 +445,10 @@ async def _handle_kds_event(body_text: str):
         _recent_events.pop((guid, state), None)
         return
 
-    method = solt.call if action == 'call' else solt.cancel
-    ok = await asyncio.to_thread(method, number)
+    if action == 'call':
+        ok = await asyncio.to_thread(solt.call, number)
+    else:
+        ok = await asyncio.to_thread(solt.cancel, number, CANCEL_TARGET)
     if not ok:
         logger.error(f'[KDS] база не подтвердила {action.upper()} для пейджера №{number}')
         _recent_events.pop((guid, state), None)
@@ -582,7 +598,7 @@ button.green:hover { background: #267526; }
       Статусы заказа (KDS state):<br>
       <b>0</b> + оплачен — новый заказ &rarr; <b>CALL</b> (инициализация пейджера)<br>
       <b>4</b> — заказ собран &rarr; <b>CALL</b> (вызов пейджера)<br>
-      <b>5</b> — заказ выдан &rarr; <b>CANCEL</b> (сброс пейджера)
+      <b>5</b> — заказ выдан &rarr; <b>CANCEL</b>, если задан [Solt] cancel_target
     </div>
   </div>
 
@@ -596,7 +612,8 @@ button.green:hover { background: #267526; }
     </div>
     <div class="row">
       <button onclick="doCall()">&#9658; CALL</button>
-      <button class="red" onclick="doCancel()">&#10007; CANCEL</button>
+      <button class="red" onclick="doCancel('SP')">&#10007; CANCEL SP</button>
+      <button class="red" onclick="doCancel('SG')">&#10007; CANCEL SG</button>
     </div>
     <div class="row">
       <button class="gray" onclick="doReg()">REG №</button>
@@ -673,7 +690,7 @@ function getNum() { return document.getElementById('number').value; }
 
 async function doPing()   { setConnected(await api('POST', '/ping')); }
 async function doCall()   { await api('POST', `/call/${getNum()}`); }
-async function doCancel() { await api('POST', `/cancel/${getNum()}`); }
+async function doCancel(t) { await api('POST', `/cancel/${getNum()}?target=${t}`); }
 async function doReg()    { await api('POST', `/reg/${getNum()}`); }
 async function doRegAll() { await api('POST', '/reg/*'); }
 

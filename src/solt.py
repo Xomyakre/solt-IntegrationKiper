@@ -167,14 +167,19 @@ class SOLT:
         logger.info(f'CALL {number}: {"OK" if ok else "FAIL"}')
         return ok
 
-    def cancel(self, number: int, timeout: float = 3.0) -> bool:
-        """Отменить вызов SP с номером number. True — база подтвердила."""
+    def cancel(self, number: int, target: str = 'SP', timeout: float = 3.0) -> bool:
+        """
+        Отменить вызов номера number. True — база подтвердила.
+        В протоколе v1.0 CANCEL описан только как событие от базы (SP — кнопочная панель),
+        команда от PC не документирована, поэтому цель (SP или SG) задаётся снаружи.
+        """
         if not self._ready('CANCEL'):
             return False
-        packet = self._transaction(f'!{self.tx_id},PC,SP,CANCEL,{number}\r\n',
+        target = target.upper()
+        packet = self._transaction(f'!{self.tx_id},PC,{target},CANCEL,{number}\r\n',
                                    cmd='CANCEL', data=str(number), timeout=timeout)
         ok = packet is not None
-        logger.info(f'CANCEL {number}: {"OK" if ok else "FAIL"}')
+        logger.info(f'CANCEL {target} {number}: {"OK" if ok else "FAIL (база не ответила)"}')
         return ok
 
     def register(self, number, timeout: float = 3.0) -> bool:
