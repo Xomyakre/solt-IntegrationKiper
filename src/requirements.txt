@@ -1,0 +1,5 @@
+fastapi
+uvicorn
+pyserial==3.5
+lxml
+requests
