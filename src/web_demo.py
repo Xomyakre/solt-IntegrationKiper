@@ -9,14 +9,18 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
+import time
+from collections import deque
 from contextlib import asynccontextmanager
 from logging.handlers import TimedRotatingFileHandler
 from typing import Optional
 
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, StreamingResponse, PlainTextResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 
 from rk7 import RK7
@@ -24,23 +28,40 @@ from solt import SOLT, SoltPacket
 
 # ------------------------------------------------------------------
 # Мост logging → SSE
-# Все записи логов (в т.ч. из потока чтения solt.py) попадают в
-# _sse_queue и стримятся в браузер через /events.
+# Все записи логов (в т.ч. из потока чтения solt.py) рассылаются
+# открытым вкладкам браузера через /events. У каждой вкладки своя
+# очередь ограниченного размера: если вкладок нет, ничего не копится.
 # ------------------------------------------------------------------
 
+SSE_HISTORY = 200      # сколько последних строк показать вкладке при подключении
+SSE_QUEUE_SIZE = 500   # если вкладка не успевает читать, лишние строки отбрасываются
+
 _loop: asyncio.AbstractEventLoop | None = None
-_sse_queue: asyncio.Queue | None = None
+_subscribers: set[asyncio.Queue] = set()
+_history: deque = deque(maxlen=SSE_HISTORY)
+
+
+def _broadcast(item: dict):
+    _history.append(item)
+    for q in list(_subscribers):
+        try:
+            q.put_nowait(item)
+        except asyncio.QueueFull:
+            pass
 
 
 class _SseHandler(logging.Handler):
     def emit(self, record):
-        if _loop and _sse_queue:
-            # call_soon_threadsafe: единственный безопасный способ положить данные
-            # в asyncio.Queue из стороннего потока (reader-поток SOLT)
-            _loop.call_soon_threadsafe(
-                _sse_queue.put_nowait,
-                {'level': record.levelname, 'msg': self.format(record)}
-            )
+        loop = _loop
+        if loop is None or loop.is_closed():
+            return
+        item = {'level': record.levelname, 'msg': self.format(record)}
+        try:
+            # call_soon_threadsafe: единственный безопасный способ передать данные
+            # в event loop из стороннего потока (reader-поток SOLT)
+            loop.call_soon_threadsafe(_broadcast, item)
+        except RuntimeError:
+            pass  # loop уже закрывается
 
 
 # Каталог, где лежит сам exe/скрипт - конфиг и логи всегда рядом с ним,
@@ -52,8 +73,25 @@ else:
 
 CONFIG_FILE = os.path.join(APP_DIR, 'config.ini')
 
+# Значения по умолчанию: программа запустится и без config.ini и создаст его сама
 _config = configparser.ConfigParser()
+_config.read_dict({
+    'Web': {'port': '8000', 'admin_user': 'admin', 'admin_password': ''},
+    'RK': {'host': '127.0.0.1', 'port': '8088', 'user': '', 'password': '', 'orderidentifier': 'SeqNum'},
+    'ComPort': {'port': 'COM1'},
+    'Log': {'log_dir': 'log', 'log_count': '10', 'log_interval': '1'},
+})
+_config_exists = os.path.exists(CONFIG_FILE)
 _config.read(CONFIG_FILE, encoding='utf-8')
+
+
+def _write_config():
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        _config.write(f)
+
+
+if not _config_exists:
+    _write_config()
 
 LOG_DIR = os.path.join(APP_DIR, _config['Log']['log_dir'])
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -75,34 +113,40 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 
 solt: SOLT | None = None
-rk7 = RK7(host=_config['RK']['Host'], port=_config['RK']['Port'],
-          user=_config['RK']['User'], password=_config['RK']['Password'])
+rk7 = RK7(host=_config['RK']['host'], port=_config['RK']['port'],
+          user=_config['RK']['user'], password=_config['RK']['password'])
 # какой идентификатор заказа передавать на пейджер: SeqNum / OrderNum
-ORDER_IDENTIFIER = _config['RK']['OrderIdentifier']
+ORDER_IDENTIFIER = _config['RK']['orderidentifier']
+ORDER_IDENTIFIERS = ('SeqNum', 'OrderNum')
 
 # COM-порт по умолчанию: аргумент командной строки переопределяет сохранённый в config.ini
-DEFAULT_PORT = sys.argv[1] if len(sys.argv) > 1 else _config['ComPort']['Port']
+DEFAULT_PORT = sys.argv[1] if len(sys.argv) > 1 else _config['ComPort']['port']
 
+PAGER_MIN, PAGER_MAX = 1, 9999
 
 # Статусы заказа, приходящие от модуля RKeeper KDS в поле "state" вебхука.
-# 0 + paid=1 — новый оплаченный заказ (CALL: инициализация пейджера)
+# 0 + paid=1 — новый оплаченный заказ (CALL: пейджеры на зарядной станции получают номер)
 # 4          — заказ собран (CALL: вызов пейджера)
 # 5          — заказ выдан (CANCEL: сброс пейджера)
 KDS_STATE_NEW = '0'
 KDS_STATE_ASSEMBLED = '4'
 KDS_STATE_ISSUED = '5'
 
+# Повтор того же статуса того же заказа в течение окна считаем дублем вебхука
+# и не звоним второй раз. Новый статус или повтор позже окна обрабатываются.
+DUPLICATE_WINDOW = 30.0
+_recent_events: dict[tuple[str, str], float] = {}
+
 
 def _save_rk_config(host: str, port: str, user: str, password: str, order_identifier: str):
     """Сохранить реквизиты подключения к кассовому серверу RK7 в config.ini и применить их."""
     global rk7, ORDER_IDENTIFIER
-    _config['RK']['Host'] = host
-    _config['RK']['Port'] = port
-    _config['RK']['User'] = user
-    _config['RK']['Password'] = password
-    _config['RK']['OrderIdentifier'] = order_identifier
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        _config.write(f)
+    _config['RK']['host'] = host
+    _config['RK']['port'] = port
+    _config['RK']['user'] = user
+    _config['RK']['password'] = password
+    _config['RK']['orderidentifier'] = order_identifier
+    _write_config()
     rk7 = RK7(host=host, port=port, user=user, password=password)
     ORDER_IDENTIFIER = order_identifier
 
@@ -115,16 +159,37 @@ def _resolve_pager_number(order: dict) -> Optional[int]:
         raw = order.get('seqNumber')
     if raw is None:
         return None
+    raw = str(raw).strip()
     # метка очереди может быть буквенно-цифровой (например "A38") - берём числовую часть
-    digits = re.sub(r'\D', '', str(raw))
-    return int(digits) if digits else None
+    digits = re.sub(r'\D', '', raw)
+    if not digits:
+        return None
+    number = int(digits)
+    if digits != raw:
+        logger.info(f'[KDS] номер "{raw}" содержит не только цифры, на пейджер уйдёт {number} '
+                    f'(заказы с разными буквами и одинаковыми цифрами получат один номер)')
+    if not PAGER_MIN <= number <= PAGER_MAX:
+        logger.error(f'[KDS] номер {number} вне диапазона пейджеров {PAGER_MIN}-{PAGER_MAX}')
+        return None
+    return number
+
+
+def _is_duplicate(guid: str, state: str) -> bool:
+    now = time.monotonic()
+    for key, ts in list(_recent_events.items()):
+        if now - ts > DUPLICATE_WINDOW:
+            del _recent_events[key]
+    key = (guid, state)
+    if key in _recent_events:
+        return True
+    _recent_events[key] = now
+    return False
 
 
 def _save_com_port(port: str):
     """Сохранить COM-порт базы пейджеров в config.ini."""
-    _config['ComPort']['Port'] = port
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        _config.write(f)
+    _config['ComPort']['port'] = port
+    _write_config()
 
 
 def _make_event_handler(cmd: str):
@@ -145,13 +210,39 @@ async def _connect_solt(port: str) -> dict:
     ok = await asyncio.to_thread(candidate.connect)
     if not ok:
         return {'ok': False, 'error': f'Cannot open {port}'}
+    # Порт открыт — оставляем объект, даже если база пока молчит:
+    # он сам будет повторять PING и переподключаться
     solt = candidate
     solt.on('CANCEL',   _make_event_handler('CANCEL'))
     solt.on('CRAD_ON',  _make_event_handler('CRAD_ON'))
     solt.on('CRAD_OFF', _make_event_handler('CRAD_OFF'))
     solt.on('OK_PRESS', _make_event_handler('OK_PRESS'))
     result = await asyncio.to_thread(solt.ping)
-    return {'ok': True, 'tx_id': result[0] if result else '?', 'group_id': result[1] if result else '?'}
+    if not result:
+        return {'ok': False, 'error': f'Порт {port} открыт, но база не ответила на PING'}
+    return {'ok': True, 'tx_id': result[0], 'group_id': result[1]}
+
+
+# ------------------------------------------------------------------
+# Доступ к веб-панели
+# Если в [Web] задан admin_password, панель и её API требуют логин/пароль
+# (HTTP Basic). Вебхук /kds открыт всегда — модуль KDS авторизоваться не умеет.
+# ------------------------------------------------------------------
+
+_basic = HTTPBasic(auto_error=False)
+
+
+def require_auth(credentials: Optional[HTTPBasicCredentials] = Depends(_basic)):
+    password = _config['Web'].get('admin_password', '')
+    if not password:
+        return
+    user = _config['Web'].get('admin_user', 'admin')
+    if credentials and \
+            secrets.compare_digest(credentials.username.encode(), user.encode()) and \
+            secrets.compare_digest(credentials.password.encode(), password.encode()):
+        return
+    raise HTTPException(status_code=401, detail='Unauthorized',
+                        headers={'WWW-Authenticate': 'Basic realm="SOLT Pager"'})
 
 
 # ------------------------------------------------------------------
@@ -160,12 +251,15 @@ async def _connect_solt(port: str) -> dict:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _loop, _sse_queue
+    global _loop
     # Сохраняем event loop здесь: на старте гарантированно получаем тот самый loop,
     # который uvicorn будет использовать. Нужен для call_soon_threadsafe из других потоков.
-    _loop = asyncio.get_event_loop()
-    _sse_queue = asyncio.Queue()
+    _loop = asyncio.get_running_loop()
     logger.info(f'Web demo started. Default port: {DEFAULT_PORT}')
+    if not _config_exists:
+        logger.warning(f'config.ini не найден, создан с настройками по умолчанию: {CONFIG_FILE}')
+    if not _config['Web'].get('admin_password', ''):
+        logger.warning('В config.ini не задан [Web] admin_password — веб-панель доступна всем в сети без пароля')
     result = await _connect_solt(DEFAULT_PORT)
     if not result['ok']:
         logger.warning(f'Автоподключение к {DEFAULT_PORT} не удалось: {result.get("error")}')
@@ -175,22 +269,23 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(lifespan=lifespan)
+panel = APIRouter(dependencies=[Depends(require_auth)])
 
 # ------------------------------------------------------------------
 # API эндпоинты
 # ------------------------------------------------------------------
 
-@app.get('/status')
+@panel.get('/status')
 async def status():
     return {
-        'connected': solt is not None,
-        'port': solt.port if solt else _config['ComPort']['Port'],
+        'connected': solt is not None and solt.connected,
+        'port': solt.port if solt else _config['ComPort']['port'],
         'tx_id': solt.tx_id if solt else None,
         'group_id': solt.group_id if solt else None,
     }
 
 
-@app.post('/connect')
+@panel.post('/connect')
 async def connect(port: str = DEFAULT_PORT):
     """Подключиться к базе: открыть порт, подписаться на события, выполнить PING."""
     result = await _connect_solt(port)
@@ -199,7 +294,7 @@ async def connect(port: str = DEFAULT_PORT):
     return result
 
 
-@app.post('/disconnect')
+@panel.post('/disconnect')
 async def disconnect():
     global solt
     if solt:
@@ -208,15 +303,16 @@ async def disconnect():
     return {'ok': True}
 
 
-@app.post('/ping')
+@panel.post('/ping')
 async def ping():
     if not solt:
         return {'ok': False, 'error': 'not connected'}
     result = await asyncio.to_thread(solt.ping)
-    return {'ok': result is not None, 'tx_id': result[0] if result else None}
+    return {'ok': result is not None, 'tx_id': result[0] if result else None,
+            'group_id': result[1] if result else None}
 
 
-@app.post('/call/{number}')
+@panel.post('/call/{number}')
 async def call(number: int):
     if not solt:
         return {'ok': False, 'error': 'not connected'}
@@ -224,7 +320,7 @@ async def call(number: int):
     return {'ok': ok}
 
 
-@app.post('/cancel/{number}')
+@panel.post('/cancel/{number}')
 async def cancel(number: int):
     if not solt:
         return {'ok': False, 'error': 'not connected'}
@@ -232,7 +328,7 @@ async def cancel(number: int):
     return {'ok': ok}
 
 
-@app.post('/reg/{number}')
+@panel.post('/reg/{number}')
 async def reg(number: str):
     if not solt:
         return {'ok': False, 'error': 'not connected'}
@@ -244,19 +340,23 @@ class RKConfig(BaseModel):
     host: str
     port: str
     user: str
-    password: str
+    password: str = ''   # пусто — оставить сохранённый пароль
     order_identifier: str
 
 
-@app.get('/rk/config')
+@panel.get('/rk/config')
 async def get_rk_config():
-    return {'host': rk7.host, 'port': rk7.port, 'user': rk7.user, 'password': rk7.password,
+    # Пароль наружу не отдаём, только признак, что он задан
+    return {'host': rk7.host, 'port': rk7.port, 'user': rk7.user, 'password_set': bool(rk7.password),
             'order_identifier': ORDER_IDENTIFIER}
 
 
-@app.post('/rk/config')
+@panel.post('/rk/config')
 async def set_rk_config(cfg: RKConfig):
-    _save_rk_config(cfg.host, cfg.port, cfg.user, cfg.password, cfg.order_identifier)
+    if cfg.order_identifier not in ORDER_IDENTIFIERS:
+        return {'ok': False, 'error': f'order_identifier должен быть одним из {ORDER_IDENTIFIERS}'}
+    password = cfg.password or rk7.password
+    _save_rk_config(cfg.host, cfg.port, cfg.user, password, cfg.order_identifier)
     logger.info(f'[RK] config saved: {cfg.host}:{cfg.port} user={cfg.user} order_identifier={cfg.order_identifier}')
     return {'ok': True}
 
@@ -269,6 +369,7 @@ async def kds_webhook(request: Request, path: str = ''):
     {"guid": "$guid", "state": "$state", "paid": "$ispaid"} — KDS отдаёт только
     guid заказа, без человеческого номера, поэтому номер (seqNumber) дополучаем
     запросом к кассовому серверу RK7 по этому guid.
+    Всегда отвечаем 200 OK: ошибки обработки только логируем.
     """
     body = await request.body()
     try:
@@ -277,24 +378,46 @@ async def kds_webhook(request: Request, path: str = ''):
         body_text = repr(body)
     logger.info(f'[KDS] {request.method} /{request.url.path.lstrip("/")}?{request.url.query}')
     logger.info(f'[KDS] body: {body_text}')
+    try:
+        await _handle_kds_event(body_text)
+    except Exception:
+        logger.exception('[KDS] ошибка обработки вебхука')
+    return PlainTextResponse('OK')
 
+
+async def _handle_kds_event(body_text: str):
     try:
         payload = json.loads(body_text)
     except json.JSONDecodeError:
         logger.error(f'[KDS] body is not valid JSON: {body_text!r}')
-        return PlainTextResponse('OK')
+        return
 
     guid = payload.get('guid')
-    state = payload.get('state')
-    paid = payload.get('paid')
+    state = str(payload.get('state'))
+    paid = str(payload.get('paid'))
     if not guid:
         logger.error(f'[KDS] no guid in payload: {payload}')
-        return PlainTextResponse('OK')
+        return
+
+    if state == KDS_STATE_NEW and paid == '1':
+        action = 'call'
+    elif state == KDS_STATE_ASSEMBLED:
+        action = 'call'
+    elif state == KDS_STATE_ISSUED:
+        action = 'cancel'
+    else:
+        logger.info(f'[KDS] guid={guid} state={state} paid={paid}: для этого статуса действий нет')
+        return
+
+    if _is_duplicate(guid, state):
+        logger.info(f'[KDS] guid={guid} state={state}: повтор за {DUPLICATE_WINDOW:.0f} с, пропускаем')
+        return
 
     order = await asyncio.to_thread(rk7.get_order, guid)
     if order is None:
         logger.error(f'[KDS] RK7: order not found for guid={guid}')
-        return PlainTextResponse('OK')
+        _recent_events.pop((guid, state), None)  # дать шанс повторному вебхуку
+        return
     number = _resolve_pager_number(order)
     logger.info(f'[KDS] guid={guid} state={state} paid={paid} -> seqNumber={order.get("seqNumber")} '
                 f'orderIdent={order.get("orderIdent")} '
@@ -302,32 +425,43 @@ async def kds_webhook(request: Request, path: str = ''):
 
     if number is None:
         logger.error(f'[KDS] не удалось получить номер пейджера ({ORDER_IDENTIFIER}) для guid={guid}')
-        return PlainTextResponse('OK')
-    if not solt:
-        logger.warning(f'[KDS] SOLT не подключен, пейджер №{number} не вызван (state={state})')
-        return PlainTextResponse('OK')
+        return
+    if not solt or not solt.connected:
+        logger.warning(f'[KDS] нет связи с базой SOLT, пейджер №{number} не вызван (state={state})')
+        _recent_events.pop((guid, state), None)
+        return
 
-    state = str(state)
-    if state == KDS_STATE_NEW and str(paid) == '1':
-        await asyncio.to_thread(solt.call, number)
-    elif state == KDS_STATE_ASSEMBLED:
-        await asyncio.to_thread(solt.call, number)
-    elif state == KDS_STATE_ISSUED:
-        await asyncio.to_thread(solt.cancel, number)
-
-    return PlainTextResponse('OK')
+    method = solt.call if action == 'call' else solt.cancel
+    ok = await asyncio.to_thread(method, number)
+    if not ok:
+        logger.error(f'[KDS] база не подтвердила {action.upper()} для пейджера №{number}')
+        _recent_events.pop((guid, state), None)
 
 
-@app.get('/events')
+@panel.get('/events')
 async def events():
     """
     SSE-стрим логов для браузера.
     X-Accel-Buffering: no — отключает буферизацию в nginx, если стоит перед приложением.
     """
+    q: asyncio.Queue = asyncio.Queue(maxsize=SSE_QUEUE_SIZE)
+    for item in _history:
+        q.put_nowait(item)
+    _subscribers.add(q)
+
     async def generate():
-        while True:
-            item = await _sse_queue.get()
-            yield f'data: {json.dumps(item)}\n\n'
+        try:
+            while True:
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ': keepalive\n\n'  # комментарий SSE: держит соединение живым
+                    continue
+                yield f'data: {json.dumps(item)}\n\n'
+        finally:
+            # вкладку закрыли — очередь больше не наполняем
+            _subscribers.discard(q)
+
     return StreamingResponse(generate(), media_type='text/event-stream',
                              headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'})
 
@@ -350,7 +484,7 @@ h1 { color: #569cd6; font-size: 20px; margin-bottom: 20px; letter-spacing: 1px; 
 .panel { background: #252526; border: 1px solid #3c3c3c; border-radius: 6px; padding: 16px; flex: 1; min-width: 280px; }
 .panel h2 { font-size: 13px; color: #9cdcfe; margin-bottom: 14px; text-transform: uppercase; letter-spacing: 1px; }
 label { font-size: 12px; color: #888; display: block; margin-bottom: 4px; }
-input[type=text], input[type=number], select {
+input[type=text], input[type=number], input[type=password], select {
     background: #3c3c3c; border: 1px solid #555; color: #d4d4d4;
     padding: 6px 10px; border-radius: 4px; font-family: inherit; font-size: 13px;
     outline: none; width: 100px;
@@ -428,7 +562,7 @@ button.green:hover { background: #267526; }
       </div>
       <div>
         <label>Пароль</label>
-        <input type="text" id="rk-password" style="width:110px">
+        <input type="password" id="rk-password" style="width:110px" autocomplete="new-password">
       </div>
     </div>
     <div class="row">
@@ -446,9 +580,9 @@ button.green:hover { background: #267526; }
     </div>
     <div class="status-row" style="display:block; line-height:1.7;">
       Статусы заказа (KDS state):<br>
-      <b>0</b> + оплачен — новый заказ → <b>CALL</b> (инициализация пейджера)<br>
-      <b>4</b> — заказ собран → <b>CALL</b> (вызов пейджера)<br>
-      <b>5</b> — заказ выдан → <b>CANCEL</b> (сброс пейджера)
+      <b>0</b> + оплачен — новый заказ &rarr; <b>CALL</b> (инициализация пейджера)<br>
+      <b>4</b> — заказ собран &rarr; <b>CALL</b> (вызов пейджера)<br>
+      <b>5</b> — заказ выдан &rarr; <b>CANCEL</b> (сброс пейджера)
     </div>
   </div>
 
@@ -498,8 +632,20 @@ function addLog(level, msg) {
 
 function clearLog() { logEl.innerHTML = ''; }
 
-// SSE: браузер сам переподключается при обрыве (стандартное поведение EventSource)
+function setConnected(d) {
+    if (d.connected || d.ok) {
+        dotEl.className = 'dot on';
+        infoEl.textContent = `Подключено (TX_ID: ${d.tx_id}  GROUP_ID: ${d.group_id})`;
+    } else {
+        dotEl.className = 'dot';
+        infoEl.textContent = d.error || 'нет связи';
+    }
+}
+
+// SSE: браузер сам переподключается при обрыве (стандартное поведение EventSource).
+// При каждом подключении сервер заново присылает последние строки, поэтому лог очищаем.
 const es = new EventSource('/events');
+es.onopen    = () => clearLog();
 es.onmessage = e => { const d = JSON.parse(e.data); addLog(d.level, d.msg); };
 es.onerror   = () => addLog('ERROR', 'SSE connection lost');
 
@@ -515,25 +661,17 @@ async function api(method, url) {
 
 async function doConnect() {
     const port = document.getElementById('port').value.trim();
-    const d = await api('POST', `/connect?port=${encodeURIComponent(port)}`);
-    if (d.ok) {
-        dotEl.className = 'dot on';
-        infoEl.textContent = `Подключено (TX_ID: ${d.tx_id}  GROUP_ID: ${d.group_id})`;
-    } else {
-        dotEl.className = 'dot';
-        infoEl.textContent = d.error || 'ошибка';
-    }
+    setConnected(await api('POST', `/connect?port=${encodeURIComponent(port)}`));
 }
 
 async function doDisconnect() {
     await api('POST', '/disconnect');
-    dotEl.className = 'dot';
-    infoEl.textContent = 'нет связи';
+    setConnected({ connected: false });
 }
 
 function getNum() { return document.getElementById('number').value; }
 
-async function doPing()   { await api('POST', '/ping'); }
+async function doPing()   { setConnected(await api('POST', '/ping')); }
 async function doCall()   { await api('POST', `/call/${getNum()}`); }
 async function doCancel() { await api('POST', `/cancel/${getNum()}`); }
 async function doReg()    { await api('POST', `/reg/${getNum()}`); }
@@ -545,7 +683,7 @@ async function loadRkConfig() {
     document.getElementById('rk-host').value = d.host;
     document.getElementById('rk-port').value = d.port;
     document.getElementById('rk-user').value = d.user;
-    document.getElementById('rk-password').value = d.password;
+    document.getElementById('rk-password').placeholder = d.password_set ? 'не менять' : 'не задан';
     document.getElementById('rk-order-identifier').value = d.order_identifier;
 }
 
@@ -565,7 +703,11 @@ async function saveRkConfig() {
             body: JSON.stringify(body),
         });
         const d = await r.json();
-        statusEl.textContent = d.ok ? 'сохранено' : 'ошибка';
+        statusEl.textContent = d.ok ? 'сохранено' : ('ошибка: ' + (d.error || ''));
+        if (d.ok) {
+            document.getElementById('rk-password').value = '';
+            loadRkConfig();
+        }
     } catch (e) {
         statusEl.textContent = 'ошибка: ' + e;
     }
@@ -575,23 +717,24 @@ async function loadStatus() {
     const r = await fetch('/status');
     const d = await r.json();
     document.getElementById('port').value = d.port;
-    if (d.connected) {
-        dotEl.className = 'dot on';
-        infoEl.textContent = `Подключено (TX_ID: ${d.tx_id}  GROUP_ID: ${d.group_id})`;
-    }
+    setConnected(d);
 }
 
 loadRkConfig();
 loadStatus();
+setInterval(loadStatus, 5000); // индикатор связи обновляется сам, в т.ч. после переподключения базы
 </script>
 </body>
 </html>
 """
 
 
-@app.get('/', response_class=HTMLResponse)
+@panel.get('/', response_class=HTMLResponse)
 async def index():
     return HTML
+
+
+app.include_router(panel)
 
 
 if __name__ == '__main__':

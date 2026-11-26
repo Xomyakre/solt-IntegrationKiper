@@ -1,0 +1,21 @@
+# Настройки с паролями — только локально, в репозитории лежит config.example.ini
+config.ini
+
+# Логи
+log/
+*.log
+
+# Сборка PyInstaller: готовый exe выкладывать в GitHub Releases
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Видео и прочие большие файлы
+*.webm
+*.mp4

@@ -10,6 +10,7 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
 logger = logging.getLogger(__name__)
 
+# Кассовый сервер обычно работает с самоподписанным сертификатом
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 GET_ORDER_TEMPLATE = '''<?xml version="1.0" encoding="UTF-8"?>
@@ -30,7 +31,7 @@ class RK7:
     HTTP-доступ к кассовому серверу RKeeper (rk7api/v0/xmlinterface.xml).
 
     Использование:
-        rk7 = RK7(host='172.20.0.114', port='8086', user='httpuser', password='24')
+        rk7 = RK7(host='172.20.0.114', port='8088', user='httpuser', password='***')
         order = rk7.get_order(guid)   # {'seqNumber': '5', 'orderName': '...', ...} или None
     """
 
@@ -48,8 +49,11 @@ class RK7:
         """Вернуть атрибуты заказа (seqNumber, orderName, paid, finished, ...) по guid, или None при ошибке."""
         xml = GET_ORDER_TEMPLATE.format(guid=_format_guid(guid))
         try:
-            resp = requests.get(self._url(), verify=False, auth=(self.user, self.password),
-                                 data=xml.encode('utf-8'), timeout=self.timeout)
+            # XML-интерфейс RK7 принимает запрос в теле POST
+            resp = requests.post(self._url(), verify=False, auth=(self.user, self.password),
+                                 data=xml.encode('utf-8'),
+                                 headers={'Content-Type': 'application/xml; charset=utf-8'},
+                                 timeout=self.timeout)
             resp.raise_for_status()
         except requests.exceptions.RequestException as e:
             logger.error(f'RK7 request failed: {e}')
